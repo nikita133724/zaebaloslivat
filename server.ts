@@ -1,865 +1,424 @@
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const fs = require('fs');
-
-const app = express();
-const server = http.createServer(app);
-
-// =========================
-// CONFIG
-// =========================
-
-const MIRROR_URL = 'https://zref.pro';
-const PORT = process.env.PORT || 3000;
-
-// Centrifugo константы
-const METHOD_CONNECT = 0;
-const METHOD_SUBSCRIBE = 1;
-const METHOD_PING = 7;
-const PUSH_PUBLICATION = 0;
-
-// Таймауты
-const DOMAIN_CHECK_INTERVAL = 60000; // 60 секунд
-const PONG_TIMEOUT = 90000; // 90 секунд
-const SILENT_SOCKET_TIMEOUT = 240000; // 4 минуты
-
-let activeDomain = null;
-let centrifugoConfig = null;
-let wsConnection = null;
-let reconnectTimer = null;
-let pingInterval = null;
-let watchdogInterval = null;
-let reconnectAttempts = 0;
-let domainWatchInterval = null;
-
-// Состояние
-let state = {
-    site_base_url: null,
-    domain_dead: false,
-    ws: null,
-    packets: 0,
-    chat_messages: 0,
-    rains: 0,
-    raws: 0,
-    last_chat_text: '',
-    last_packet_time: null,
-    last_pong_time: null,
-    last_connected_time: null,
-    pending_ping_id: null,
-    pending_ping_time: null,
-    reconnect_reason: ''
-};
-
-// Клиенты SSE
-const clients = new Set();
-
-// =========================
-// HTTP HELPER с редиректами
-// =========================
-
-async function httpGetText(url, timeout = 25000) {
-    const response = await axios.get(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
-        },
-        timeout: timeout,
-        maxRedirects: 10,
-        validateStatus: null
-    });
-    
-    if (response.status >= 400) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    
-    return { text: response.data, url: response.request.res.responseUrl };
-}
-
-// =========================
-// ПРОВЕРКА ЖИВНОСТИ ДОМЕНА
-// =========================
-
-async function isDomainAlive(siteBaseUrl) {
-    try {
-        // Извлекаем хост
-        const host = siteBaseUrl.replace(/^https?:\/\//, '').replace(/\/$/, '').split('/')[0];
-        
-        // Пробуем и HTTPS, и HTTP
-        for (const proto of ['https', 'http']) {
-            try {
-                const checkUrl = `${proto}://${host}`;
-                const response = await axios.get(checkUrl, {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    },
-                    timeout: 5000,
-                    maxRedirects: 3,
-                    validateStatus: null
-                });
-                
-                const size = (response.data || '').length;
-                if (response.status >= 200 && response.status < 300 && size > 1000) {
-                    return true;
-                }
-            } catch (e) {
-                // Пробуем следующий протокол
-            }
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat Monitor</title>
+    <meta charset="utf-8">
+    <style>
+        * { box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; 
+            padding: 20px; 
+            background: #0f0f1a; 
+            color: #e0e0e0;
+            margin: 0;
         }
-        return false;
-    } catch (error) {
-        console.log('[DOMAIN CHECK ERROR]', error.message);
-        return false;
-    }
-}
-
-// =========================
-// ПОЛУЧЕНИЕ АКТУАЛЬНОГО ДОМЕНА (КАК В ПИТОНЕ)
-// =========================
-
-async function fetchActualDomain() {
-    console.log('[DOMAIN] Fetching from', MIRROR_URL);
-    
-    try {
-        const { text, url } = await httpGetText(MIRROR_URL);
+        .container { max-width: 1200px; margin: 0 auto; }
         
-        // 1. Ищем meta refresh (основной способ)
-        let match = text.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"'\s;>]+)/i);
+        /* Stats panel */
+        .stats-panel {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 30px;
+            flex-wrap: wrap;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .stat {
+            flex: 1;
+            min-width: 120px;
+            text-align: center;
+            padding: 10px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+        }
+        .stat-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-value { font-size: 28px; font-weight: bold; color: #4ecdc4; }
+        .stat-value.connected { color: #4ecdc4; }
+        .stat-value.disconnected { color: #ff6b6b; }
         
-        if (!match) {
-            // 2. Ищем URL в тексте
-            match = text.match(/URL\s*=\s*(https?:\/\/[^"'\s>]+)/i);
+        /* Search */
+        .search-box {
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .search-box input {
+            flex: 1;
+            padding: 10px 15px;
+            background: #0f0f1a;
+            border: 1px solid #2a2a3e;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+        .search-box button {
+            padding: 10px 20px;
+            background: #4ecdc4;
+            border: none;
+            border-radius: 6px;
+            color: #1a1a2e;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .search-box button:hover { opacity: 0.9; }
+        
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #2a2a3e;
+        }
+        .tab {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .tab.active {
+            color: #4ecdc4;
+            border-bottom: 2px solid #4ecdc4;
         }
         
-        if (match) {
-            let siteUrl = match[1].trim();
-            // Относительный путь
-            if (siteUrl.startsWith('/')) {
-                siteUrl = 'https://zref.pro' + siteUrl;
-            }
-            siteUrl = siteUrl.replace(/\/$/, '');
-            console.log('[DOMAIN] Found via redirect:', siteUrl);
-            return siteUrl;
+        /* Chat messages */
+        .chat-container {
+            background: #1a1a2e;
+            border-radius: 12px;
+            overflow: hidden;
         }
-        
-        // 3. Используем конечный URL после редиректов
-        if (url && url.startsWith('http')) {
-            const siteUrl = url.replace(/\/$/, '');
-            console.log('[DOMAIN] Using final URL:', siteUrl);
-            return siteUrl;
+        .messages {
+            height: 500px;
+            overflow-y: auto;
+            padding: 15px;
+            display: flex;
+            flex-direction: column-reverse;
         }
+        .message {
+            padding: 8px 12px;
+            border-bottom: 1px solid #2a2a3e;
+            font-size: 13px;
+        }
+        .message:hover { background: #22223b; }
+        .message-rain {
+            background: #2a1a3e;
+            border-left: 3px solid #ff6b6b;
+        }
+        .time { color: #666; font-size: 11px; margin-right: 10px; }
+        .nick { 
+            color: #4ecdc4; 
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .nick:hover { text-decoration: underline; }
+        .status-vip { color: #ffd700; font-size: 10px; margin-left: 5px; }
+        .status-admin { color: #ff6b6b; font-size: 10px; margin-left: 5px; }
+        .text { color: #e0e0e0; word-break: break-word; }
+        .rain-icon { color: #ff6b6b; margin-right: 5px; }
         
-        throw new Error('Could not find actual domain');
+        /* Users list */
+        .users-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .user-item {
+            padding: 10px;
+            border-bottom: 1px solid #2a2a3e;
+            cursor: pointer;
+        }
+        .user-item:hover { background: #22223b; }
+        .user-nick { font-weight: bold; color: #4ecdc4; }
+        .user-status { font-size: 10px; color: #888; }
+        .user-last { font-size: 11px; color: #666; margin-top: 4px; }
         
-    } catch (error) {
-        console.error('[DOMAIN ERROR]', error.message);
-        throw error;
-    }
-}
+        /* User messages */
+        .user-messages {
+            margin-top: 20px;
+            border-top: 1px solid #2a2a3e;
+            padding-top: 15px;
+        }
+        .back-btn {
+            background: #2a2a3e;
+            border: none;
+            color: #e0e0e0;
+            padding: 5px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="stats-panel">
+        <div class="stat">
+            <div class="stat-label">Статус</div>
+            <div class="stat-value" id="wsStatus">⏳</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Домен</div>
+            <div class="stat-value" id="domain" style="font-size: 14px;">-</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Сообщений</div>
+            <div class="stat-value" id="msgCount">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Дождей</div>
+            <div class="stat-value" id="rainCount">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-label">Пакетов</div>
+            <div class="stat-value" id="packets">0</div>
+        </div>
+    </div>
+    
+    <div class="search-box">
+        <input type="text" id="userSearch" placeholder="Поиск по нику или ID пользователя...">
+        <button onclick="searchUser()">Найти</button>
+    </div>
+    
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('chat')">💬 Чат</button>
+        <button class="tab" onclick="showTab('users')">👥 Пользователи</button>
+        <button class="tab" onclick="showTab('rains')">🌧️ Дожди</button>
+    </div>
+    
+    <div id="chatTab" class="chat-container">
+        <div class="messages" id="messages"></div>
+    </div>
+    
+    <div id="usersTab" style="display: none;">
+        <div class="users-list" id="usersList"></div>
+        <div id="userMessagesPanel" style="display: none;">
+            <button class="back-btn" onclick="closeUserMessages()">← Назад к списку</button>
+            <div class="chat-container">
+                <div class="messages" id="userMessages"></div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="rainsTab" style="display: none;">
+        <div class="messages" id="rainsList" style="height: 400px; overflow-y: auto;"></div>
+    </div>
+</div>
 
-// =========================
-// ПОЛУЧЕНИЕ CONFIG С АКТУАЛЬНОГО ДОМЕНА
-// =========================
-
-async function fetchCentrifugeConfig() {
-    const siteBaseUrl = await fetchActualDomain();
-    activeDomain = siteBaseUrl;
-    state.site_base_url = siteBaseUrl;
+<script>
+    let currentUser = null;
+    let messages = [];
+    let rains = [];
     
-    console.log('[CONFIG] Fetching from', siteBaseUrl);
+    const eventSource = new EventSource('/events');
     
-    const { text } = await httpGetText(siteBaseUrl + '/');
-    
-    // Сохраняем HTML для отладки (если нужно)
-    // fs.writeFileSync('debug.html', text);
-    
-    // Ищем centrifugoSocket (основной паттерн)
-    let wsMatch = text.match(/centrifugoSocket\s*=\s*['"]([^'"]+)['"]/);
-    
-    // Альтернативные паттерны
-    if (!wsMatch) {
-        wsMatch = text.match(/centrifugoSocket:\s*['"]([^'"]+)['"]/);
-    }
-    if (!wsMatch) {
-        wsMatch = text.match(/socketUrl\s*=\s*['"]([^'"]+)['"]/);
-    }
-    
-    // Ищем centrifugoSecret
-    let tokenMatch = text.match(/centrifugoSecret\s*=\s*['"]([^'"]+)['"]/);
-    
-    if (!tokenMatch) {
-        tokenMatch = text.match(/centrifugoSecret:\s*['"]([^'"]+)['"]/);
-    }
-    
-    // Ищем в window.__INITIAL_STATE__
-    if (!tokenMatch) {
-        const initStateMatch = text.match(/__INITIAL_STATE__\s*=\s*({[^;]+})/);
-        if (initStateMatch) {
-            try {
-                const initState = JSON.parse(initStateMatch[1]);
-                if (initState.centrifugoSecret) {
-                    tokenMatch = [null, initState.centrifugoSecret];
-                }
-                if (!wsMatch && initState.centrifugoSocket) {
-                    wsMatch = [null, initState.centrifugoSocket];
-                }
-            } catch(e) {}
+    eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'status') {
+            updateStatus(data.data);
+        } else if (data.type === 'message') {
+            addMessage(data.data);
+        } else if (data.type === 'rain') {
+            addRain(data.data);
         }
-    }
-    
-    if (!wsMatch) {
-        console.error('[CONFIG] centrifugoSocket not found!');
-        throw new Error('centrifugoSocket not found in HTML');
-    }
-    
-    if (!tokenMatch) {
-        console.error('[CONFIG] centrifugoSecret not found!');
-        throw new Error('centrifugoSecret not found in HTML');
-    }
-    
-    let wsUrl = wsMatch[1].trim();
-    const token = tokenMatch[1].trim();
-    
-    // Преобразуем ws:// в wss:// если нужно
-    if (wsUrl.startsWith('ws://')) {
-        wsUrl = wsUrl.replace('ws://', 'wss://');
-    }
-    
-    console.log('[CONFIG] WS URL:', wsUrl);
-    console.log('[CONFIG] Token:', token.substring(0, 10) + '...');
-    
-    centrifugoConfig = {
-        siteBaseUrl,
-        origin: siteBaseUrl,
-        wsUrl,
-        token
     };
     
-    return centrifugoConfig;
-}
-
-// =========================
-// ВОССТАНОВЛЕНИЕ ДОМЕНА ПРИ СМЕРТИ
-// =========================
-
-async function domainWatchLoop() {
-    while (true) {
-        await new Promise(resolve => setTimeout(resolve, DOMAIN_CHECK_INTERVAL));
+    function updateStatus(statusData) {
+        const wsSpan = document.getElementById('wsStatus');
+        wsSpan.textContent = statusData.connected ? '✅' : '❌';
+        wsSpan.className = `stat-value ${statusData.connected ? 'connected' : 'disconnected'}`;
         
-        if (!state.site_base_url) continue;
+        document.getElementById('domain').textContent = statusData.domain || '-';
+        if (statusData.stats) {
+            document.getElementById('msgCount').textContent = statusData.stats.chat_messages || 0;
+            document.getElementById('rainCount').textContent = statusData.stats.rains || 0;
+            document.getElementById('packets').textContent = statusData.stats.packets || 0;
+        }
+    }
+    
+    function addMessage(msg) {
+        const messagesDiv = document.getElementById('messages');
+        const div = createMessageElement(msg);
+        messagesDiv.insertBefore(div, messagesDiv.firstChild);
+        
+        // Ограничиваем количество сообщений
+        while (messagesDiv.children.length > 500) {
+            messagesDiv.removeChild(messagesDiv.lastChild);
+        }
+        
+        // Если открыты сообщения пользователя
+        if (currentUser && (msg.userId === currentUser.userId || msg.nickname === currentUser.nickname)) {
+            const userMessagesDiv = document.getElementById('userMessages');
+            const userDiv = createMessageElement(msg);
+            userMessagesDiv.insertBefore(userDiv, userMessagesDiv.firstChild);
+        }
+    }
+    
+    function createMessageElement(msg) {
+        const div = document.createElement('div');
+        div.className = 'message';
+        
+        const statusBadge = msg.status === 'VIP' ? '<span class="status-vip">👑</span>' : 
+                           (msg.status === 'ADMIN' ? '<span class="status-admin">⚡</span>' : '');
+        
+        div.innerHTML = `
+            <span class="time">[${msg.messageTime || '--:--'}]</span>
+            <span class="nick" onclick="showUserMessages('${msg.userId || ''}', '${escapeHtml(msg.nickname || '')}')">
+                ${escapeHtml(msg.nickname || '?')}${statusBadge}
+            </span>
+            <span class="text">${escapeHtml(msg.message || '')}</span>
+        `;
+        return div;
+    }
+    
+    function addRain(rain) {
+        const rainsDiv = document.getElementById('rainsList');
+        const div = document.createElement('div');
+        div.className = 'message message-rain';
+        div.innerHTML = `
+            <span class="time">[${rain.messageTime || '--:--'}]</span>
+            <span class="rain-icon">🌧️</span>
+            <span class="nick">${escapeHtml(rain.launcher || '?')}</span>
+            <span class="text">💰 ${rain.totalAmount || '?'} | 🏆 ${rain.prizesCount || 0} победителей</span>
+        `;
+        rainsDiv.insertBefore(div, rainsDiv.firstChild);
+        
+        rains.unshift(rain);
+        document.getElementById('rainCount').textContent = rains.length;
+    }
+    
+    async function showUserMessages(userId, nickname) {
+        currentUser = { userId, nickname };
         
         try {
-            const alive = await isDomainAlive(state.site_base_url);
+            const response = await fetch(`/user/${userId}/messages`);
+            const userMessages = await response.json();
             
-            if (alive) {
-                state.last_domain_check_ok = Date.now();
-                if (state.domain_dead) {
-                    console.log('[DOMAIN] Domain is alive again!');
-                    state.domain_dead = false;
-                }
-                continue;
+            document.getElementById('usersList').style.display = 'none';
+            document.getElementById('userMessagesPanel').style.display = 'block';
+            
+            const container = document.getElementById('userMessages');
+            container.innerHTML = '';
+            container.innerHTML = `<div style="padding: 10px; background: #2a2a3e; margin-bottom: 10px;">💬 Сообщения пользователя: <strong>${escapeHtml(nickname)}</strong></div>`;
+            
+            for (const msg of userMessages.reverse()) {
+                const div = createMessageElement(msg);
+                container.appendChild(div);
             }
             
-            console.log('[DOMAIN DEAD]', state.site_base_url);
-            state.domain_dead = true;
-            state.reconnect_reason = 'domain_dead';
-            
-            // Закрываем WebSocket
-            if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                wsConnection.close();
+            if (userMessages.length === 0) {
+                container.innerHTML += '<div style="padding: 20px; text-align: center; color: #666;">Нет сообщений от этого пользователя</div>';
             }
-            
-            // Пытаемся получить новый домен
-            try {
-                const newDomain = await fetchActualDomain();
-                if (newDomain !== state.site_base_url) {
-                    console.log('[DOMAIN] New domain found:', newDomain);
-                    state.site_base_url = newDomain;
-                    activeDomain = newDomain;
-                    state.domain_dead = false;
-                    // Переподключаемся с новым доменом
-                    if (wsConnection) wsConnection.close();
-                }
-            } catch (e) {
-                console.log('[DOMAIN] Failed to get new domain:', e.message);
-            }
-            
         } catch (error) {
-            console.log('[DOMAIN WATCH ERROR]', error.message);
-        }
-    }
-}
-
-// =========================
-// WEBSOCKET WATCHDOG
-// =========================
-
-function startWatchdog() {
-    if (watchdogInterval) clearInterval(watchdogInterval);
-    
-    watchdogInterval = setInterval(() => {
-        if (!wsConnection || wsConnection.readyState !== WebSocket.OPEN) return;
-        
-        const now = Date.now();
-        
-        // 1. Проверка PONG
-        if (state.pending_ping_time && (now - state.pending_ping_time) >= PONG_TIMEOUT) {
-            console.log('[WATCHDOG] No PONG, reconnecting...');
-            state.reconnect_reason = 'ping_timeout';
-            wsConnection.close();
-            return;
-        }
-        
-        // 2. Проверка тишины
-        if (state.last_packet_time && (now - state.last_packet_time) >= SILENT_SOCKET_TIMEOUT) {
-            console.log('[WATCHDOG] Silent socket, reconnecting...');
-            state.reconnect_reason = 'silent_socket';
-            wsConnection.close();
-            return;
-        }
-        
-        // 3. Проверка домена
-        if (state.domain_dead) {
-            console.log('[WATCHDOG] Domain dead, reconnecting...');
-            wsConnection.close();
-            return;
-        }
-        
-    }, 10000);
-}
-
-// =========================
-// CENTRIFUGO WEBSOCKET
-// =========================
-
-function sendWsMessage(ws, message) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(message));
-    }
-}
-
-async function connectCentrifugo() {
-    if (!centrifugoConfig) {
-        await fetchCentrifugeConfig();
-    }
-    
-    if (wsConnection && (wsConnection.readyState === WebSocket.OPEN || wsConnection.readyState === WebSocket.CONNECTING)) {
-        console.log('[WS] Already connected');
-        return wsConnection;
-    }
-    
-    console.log('[WS] Connecting to', centrifugoConfig.wsUrl);
-    
-    return new Promise((resolve, reject) => {
-        const ws = new WebSocket(centrifugoConfig.wsUrl, {
-            headers: {
-                'Origin': centrifugoConfig.origin,
-                'User-Agent': 'Mozilla/5.0'
-            }
-        });
-        
-        const timeout = setTimeout(() => {
-            if (ws.readyState !== WebSocket.OPEN) {
-                ws.close();
-                reject(new Error('WebSocket connection timeout'));
-            }
-        }, 10000);
-        
-        ws.on('open', async () => {
-            clearTimeout(timeout);
-            console.log('[WS] Connected');
-            wsConnection = ws;
-            state.ws = true;
-            state.last_connected_time = Date.now();
-            state.last_packet_time = Date.now();
-            state.last_pong_time = Date.now();
-            
-            // Отправляем CONNECT с токеном
-            const connectMsg = {
-                id: 1,
-                method: METHOD_CONNECT,
-                params: { token: centrifugoConfig.token }
-            };
-            sendWsMessage(ws, connectMsg);
-            console.log('[WS] Sent CONNECT');
-        });
-        
-        ws.on('message', (data) => {
-            handleWsMessage(data.toString());
-        });
-        
-        ws.on('error', (error) => {
-            console.error('[WS ERROR]', error.message);
-            clearTimeout(timeout);
-        });
-        
-        ws.on('close', (code, reason) => {
-            console.log('[WS] Closed:', code, reason?.toString() || '');
-            wsConnection = null;
-            state.ws = false;
-            if (pingInterval) {
-                clearInterval(pingInterval);
-                pingInterval = null;
-            }
-            scheduleReconnect();
-        });
-        
-        // Ждем подтверждение CONNECT и SUBSCRIBE
-        let connected = false;
-        
-        const messageHandler = (data) => {
-            try {
-                const packet = JSON.parse(data.toString());
-                
-                // CONNECT ответ
-                if (packet.id === 1) {
-                    if (packet.error) {
-                        ws.removeListener('message', messageHandler);
-                        reject(new Error(`CONNECT error: ${JSON.stringify(packet.error)}`));
-                    } else {
-                        console.log('[WS] CONNECT success, client:', packet.result?.client);
-                        
-                        // Отправляем SUBSCRIBE на канал chat
-                        const subscribeMsg = {
-                            id: 2,
-                            method: METHOD_SUBSCRIBE,
-                            params: { channel: 'chat' }
-                        };
-                        sendWsMessage(ws, subscribeMsg);
-                        console.log('[WS] Sent SUBSCRIBE to chat');
-                    }
-                }
-                
-                // SUBSCRIBE ответ
-                if (packet.id === 2) {
-                    if (packet.error) {
-                        console.error('[WS] SUBSCRIBE error:', packet.error);
-                    } else {
-                        console.log('[WS] SUBSCRIBE success');
-                        connected = true;
-                        ws.removeListener('message', messageHandler);
-                        
-                        // Запускаем PING интервал
-                        if (pingInterval) clearInterval(pingInterval);
-                        pingInterval = setInterval(() => {
-                            if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                                const pingId = Date.now();
-                                state.pending_ping_id = pingId;
-                                state.pending_ping_time = Date.now();
-                                sendWsMessage(wsConnection, {
-                                    id: pingId,
-                                    method: METHOD_PING
-                                });
-                            }
-                        }, 25000);
-                        
-                        startWatchdog();
-                        resolve(ws);
-                    }
-                }
-                
-                // PONG ответ
-                if (packet.id && packet.id === state.pending_ping_id) {
-                    state.pending_ping_id = null;
-                    state.pending_ping_time = null;
-                    state.last_pong_time = Date.now();
-                }
-                
-            } catch(e) {}
-        };
-        
-        ws.on('message', messageHandler);
-    });
-}
-
-// =========================
-// HTML PARSING (ЧАТ И ПОЛЬЗОВАТЕЛИ)
-// =========================
-
-function cleanText(text) {
-    if (!text) return '';
-    return String(text).replace(/\s+/g, ' ').trim();
-}
-
-function parseChatHtml(htmlText, rawPayload) {
-    try {
-        const $ = cheerio.load(htmlText);
-        const root = $('.rightBlockChatMessageBlock').first();
-        
-        if (!root.length) {
-            return {
-                timeISO: new Date().toISOString(),
-                event: 'raw_chat_html',
-                raw: rawPayload
-            };
-        }
-        
-        const classes = root.attr('class') || '';
-        const nickname = cleanText(root.find('.rightBlockChatMessageNick').text());
-        const message = cleanText(root.find('.rightBlockChatMessageText').text());
-        const messageTime = cleanText(root.find('.rightBlockChatMessageTimeBlock').text());
-        const profileLink = root.find('a[href^="/user/"]').attr('href') || '';
-        
-        // Извлекаем ID пользователя из profileLink
-        let userId = null;
-        const userMatch = profileLink.match(/\/user\/(\d+)/);
-        if (userMatch) userId = userMatch[1];
-        
-        // Извлекаем статус (VIP, ADMIN и т.д.)
-        let status = null;
-        if (classes.includes('vip')) status = 'VIP';
-        if (classes.includes('admin')) status = 'ADMIN';
-        if (classes.includes('moderator')) status = 'MODERATOR';
-        
-        const isRain = classes.includes('rainDropChat');
-        
-        if (isRain) {
-            const rainId = root.attr('id');
-            const launcher = cleanText(root.find('.rainDropChat__author, .rainDropChat__nick, .rightBlockChatMessageNick').first().text()) || 'Неизвестно';
-            
-            let totalAmount = '';
-            const text = root.text();
-            const amountMatch = text.match(/(\d[\d\s]*(?:[.,]\d+)?)\s*₽/);
-            if (amountMatch) totalAmount = amountMatch[0];
-            
-            const winners = [];
-            root.find('.rainDropChat__winnersList a[href^="/user/"], .rainDropChat__winnerLink[href^="/user/"]').each((i, el) => {
-                const href = $(el).attr('href');
-                const name = cleanText($(el).text()) || cleanText($(el).find('img').attr('alt'));
-                if (href && name) {
-                    winners.push({ nickname: name, profile: href });
-                }
-            });
-            
-            state.rains++;
-            broadcastToClients({
-                type: 'rain',
-                data: {
-                    messageTime,
-                    launcher,
-                    totalAmount,
-                    prizesCount: winners.length,
-                    winners
-                }
-            });
-            
-            return {
-                timeISO: new Date().toISOString(),
-                event: 'rain_drop_chat',
-                messageTime,
-                rainId,
-                launcher,
-                totalAmount,
-                prizesCount: winners.length,
-                winners
-            };
-        }
-        
-        if (nickname || message || messageTime) {
-            state.chat_messages++;
-            state.last_chat_text = `${messageTime} | ${nickname}: ${message.substring(0, 100)}`;
-            
-            const chatData = {
-                messageTime,
-                nickname,
-                message,
-                profile: profileLink,
-                userId,
-                status
-            };
-            
-            // Отправляем всем SSE клиентам
-            broadcastToClients({
-                type: 'message',
-                data: chatData
-            });
-            
-            console.log(`[CHAT] ${messageTime} | ${nickname}: ${message}`);
-            
-            return {
-                timeISO: new Date().toISOString(),
-                event: 'chat_message',
-                messageTime,
-                nickname,
-                message,
-                userId,
-                profile: profileLink,
-                status
-            };
-        }
-        
-        return {
-            timeISO: new Date().toISOString(),
-            event: 'raw_chat_html',
-            text: cleanText($.text()),
-            raw: rawPayload
-        };
-        
-    } catch (error) {
-        console.error('[PARSE ERROR]', error.message);
-        return {
-            timeISO: new Date().toISOString(),
-            event: 'parse_error',
-            error: error.message,
-            raw: rawPayload
-        };
-    }
-}
-
-function parseChatPublication(publication) {
-    const data = publication.data || publication;
-    
-    if (data && typeof data === 'object') {
-        const inner = data.data || data;
-        if (inner && inner.html && typeof inner.html === 'string') {
-            return parseChatHtml(inner.html, data);
+            console.error('Failed to load user messages:', error);
         }
     }
     
-    return {
-        timeISO: new Date().toISOString(),
-        event: 'raw_chat_publication',
-        raw: data
-    };
-}
-
-function handleWsMessage(rawData) {
-    state.packets++;
-    state.last_packet_time = Date.now();
-    
-    try {
-        const packet = JSON.parse(rawData);
-        
-        // Пропускаем command responses
-        if (packet.id) return;
-        
-        const result = packet.result;
-        if (!result || typeof result !== 'object') return;
-        
-        const pushType = result.type;
-        const channel = result.channel;
-        
-        if (pushType === PUSH_PUBLICATION && channel === 'chat') {
-            const publication = result.data || {};
-            parseChatPublication(publication);
-        }
-        
-    } catch (error) {
-        console.error('[WS PARSE ERROR]', error.message);
-        state.raws++;
+    function closeUserMessages() {
+        currentUser = null;
+        document.getElementById('usersList').style.display = 'block';
+        document.getElementById('userMessagesPanel').style.display = 'none';
+        loadUsers();
     }
-}
-
-// =========================
-// ПЕРЕПОДКЛЮЧЕНИЕ
-// =========================
-
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
     
-    // Экспоненциальная задержка
-    const delay = Math.min(30, Math.pow(2, reconnectAttempts)) * 1000;
-    reconnectAttempts++;
-    
-    console.log(`[RECONNECT] Attempt ${reconnectAttempts} in ${delay/1000}s (${state.reconnect_reason || 'unknown'})`);
-    
-    reconnectTimer = setTimeout(async () => {
-        reconnectTimer = null;
+    async function loadUsers() {
         try {
-            // Обновляем конфиг (домен мог измениться)
-            await fetchCentrifugeConfig();
-            await connectCentrifugo();
-            reconnectAttempts = 0;
-            state.reconnect_reason = '';
-            broadcastToClients({ type: 'status', data: { connected: true, stats: state } });
+            const response = await fetch('/users');
+            const users = await response.json();
+            
+            const container = document.getElementById('usersList');
+            container.innerHTML = '';
+            
+            for (const user of users) {
+                const div = document.createElement('div');
+                div.className = 'user-item';
+                div.onclick = () => showUserMessages(user.userId, user.nickname);
+                div.innerHTML = `
+                    <div class="user-nick">${escapeHtml(user.nickname)}</div>
+                    <div class="user-status">${user.status || 'обычный'} • ID: ${user.userId}</div>
+                    <div class="user-last">Последнее: ${user.lastSeen || '—'}</div>
+                `;
+                container.appendChild(div);
+            }
+            
+            if (users.length === 0) {
+                container.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Пользователи не найдены</div>';
+            }
         } catch (error) {
-            console.error('[RECONNECT ERROR]', error.message);
-            scheduleReconnect();
+            console.error('Failed to load users:', error);
         }
-    }, delay);
-}
-
-// =========================
-// SSE (Server-Sent Events)
-// =========================
-
-function broadcastToClients(data) {
-    const message = `data: ${JSON.stringify(data)}\n\n`;
-    clients.forEach(client => {
+    }
+    
+    async function searchUser() {
+        const query = document.getElementById('userSearch').value.trim().toLowerCase();
+        if (!query) return;
+        
         try {
-            client.write(message);
+            const response = await fetch('/users');
+            const users = await response.json();
+            
+            const user = users.find(u => 
+                u.nickname.toLowerCase().includes(query) || 
+                u.userId === query
+            );
+            
+            if (user) {
+                showUserMessages(user.userId, user.nickname);
+                showTab('users');
+                document.getElementById('userSearch').value = '';
+            } else {
+                alert('Пользователь не найден');
+            }
         } catch (error) {
-            clients.delete(client);
+            alert('Ошибка поиска');
         }
-    });
-}
-
-// =========================
-// API ENDPOINTS
-// =========================
-
-app.get('/events', (req, res) => {
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
-    });
-    
-    clients.add(res);
-    
-    // Отправляем текущий статус
-    res.write(`data: ${JSON.stringify({ 
-        type: 'status', 
-        data: {
-            connected: wsConnection && wsConnection.readyState === WebSocket.OPEN,
-            domain: activeDomain,
-            stats: {
-                packets: state.packets,
-                chat_messages: state.chat_messages,
-                rains: state.rains,
-                raws: state.raws
-            }
-        } 
-    })}\n\n`);
-    
-    req.on('close', () => {
-        clients.delete(res);
-    });
-});
-
-app.get('/status', (req, res) => {
-    res.json({
-        connected: wsConnection && wsConnection.readyState === WebSocket.OPEN,
-        domain: activeDomain,
-        domain_dead: state.domain_dead,
-        stats: {
-            packets: state.packets,
-            chat_messages: state.chat_messages,
-            rains: state.rains,
-            raws: state.raws,
-            last_chat: state.last_chat_text
-        },
-        reconnect_attempts: reconnectAttempts,
-        last_reconnect_reason: state.reconnect_reason
-    });
-});
-
-// Поиск сообщений по пользователю
-app.get('/user/:userId/messages', (req, res) => {
-    const userId = req.params.userId;
-    try {
-        const messages = [];
-        if (fs.existsSync('chatlog.jsonl')) {
-            const content = fs.readFileSync('chatlog.jsonl', 'utf8');
-            const lines = content.trim().split('\n');
-            for (const line of lines.slice(-200)) {
-                if (line.trim()) {
-                    try {
-                        const msg = JSON.parse(line);
-                        if (msg.userId === userId || msg.profile?.includes(`/user/${userId}`)) {
-                            messages.push(msg);
-                        }
-                    } catch(e) {}
-                }
-            }
-        }
-        res.json(messages.reverse());
-    } catch (error) {
-        res.json([]);
-    }
-});
-
-app.get('/users', (req, res) => {
-    const users = new Map();
-    try {
-        if (fs.existsSync('chatlog.jsonl')) {
-            const content = fs.readFileSync('chatlog.jsonl', 'utf8');
-            const lines = content.trim().split('\n');
-            for (const line of lines.slice(-1000)) {
-                if (line.trim()) {
-                    try {
-                        const msg = JSON.parse(line);
-                        if (msg.userId && msg.nickname) {
-                            if (!users.has(msg.userId)) {
-                                users.set(msg.userId, {
-                                    userId: msg.userId,
-                                    nickname: msg.nickname,
-                                    status: msg.status,
-                                    lastSeen: msg.messageTime,
-                                    lastMessage: msg.message
-                                });
-                            }
-                        }
-                    } catch(e) {}
-                }
-            }
-        }
-    } catch (error) {}
-    res.json(Array.from(users.values()));
-});
-
-app.get('/chat', (req, res) => {
-    try {
-        const messages = [];
-        if (fs.existsSync('chatlog.jsonl')) {
-            const content = fs.readFileSync('chatlog.jsonl', 'utf8');
-            const lines = content.trim().split('\n');
-            for (const line of lines.slice(-200)) {
-                if (line.trim()) {
-                    try {
-                        const msg = JSON.parse(line);
-                        if (msg.event === 'chat_message') {
-                            messages.push(msg);
-                        }
-                    } catch(e) {}
-                }
-            }
-        }
-        res.json(messages.reverse());
-    } catch (error) {
-        res.json([]);
-    }
-});
-
-app.use(express.static('public'));
-
-// =========================
-// ЗАПУСК
-// =========================
-
-async function start() {
-    console.log('[START] Initializing...');
-    
-    // Запускаем фоновую проверку домена
-    domainWatchLoop();
-    
-    try {
-        await fetchCentrifugeConfig();
-        await connectCentrifugo();
-    } catch (error) {
-        console.error('[START ERROR]', error.message);
-        scheduleReconnect();
     }
     
-    server.listen(PORT, () => {
-        console.log(`[SERVER] Running on http://localhost:${PORT}`);
-    });
-}
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n[SHUTDOWN] Closing...');
-    if (pingInterval) clearInterval(pingInterval);
-    if (watchdogInterval) clearInterval(watchdogInterval);
-    if (domainWatchInterval) clearInterval(domainWatchInterval);
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (wsConnection) wsConnection.close();
-    server.close(() => process.exit(0));
-});
-
-start();
+    function showTab(tab) {
+        document.getElementById('chatTab').style.display = tab === 'chat' ? 'block' : 'none';
+        document.getElementById('usersTab').style.display = tab === 'users' ? 'block' : 'none';
+        document.getElementById('rainsTab').style.display = tab === 'rains' ? 'block' : 'none';
+        
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        event.target.classList.add('active');
+        
+        if (tab === 'users') {
+            loadUsers();
+        }
+    }
+    
+    function escapeHtml(text) {
+        if (!text) return '';
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    
+    // Загрузка истории
+    async function loadHistory() {
+        try {
+            const response = await fetch('/chat');
+            const history = await response.json();
+            
+            const messagesDiv = document.getElementById('messages');
+            messagesDiv.innerHTML = '';
+            
+            for (const msg of history.reverse()) {
+                const div = createMessageElement(msg);
+                messagesDiv.appendChild(div);
+            }
+        } catch (error) {
+            console.error('Failed to load history:', error);
+        }
+    }
+    
+    loadHistory();
+</script>
+</body>
+</html>
