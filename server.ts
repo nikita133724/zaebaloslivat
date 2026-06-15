@@ -6,7 +6,6 @@ import WebSocket from 'ws';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import https from 'https';
-import { formatISO } from 'date-fns';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
@@ -43,6 +42,8 @@ const DOMAIN_CHECK_INTERVAL = 60000;
 const PLANNED_RECONNECT_MIN = 3600000;
 const PLANNED_RECONNECT_MAX = 5400000;
 const MIN_ALIVE_HTML_SIZE = 1000;
+const MIN_RETRY = 1000;
+const MAX_RETRY = 20000;
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -58,18 +59,26 @@ const METHOD_SUBSCRIBE = 1;
 const METHOD_PING = 7;
 
 const PUSH_PUBLICATION = 0;
+const PUSH_MESSAGE = 4;
 
 interface ChatMessage {
   id: string;
+  event: 'chat_message' | 'raw_chat_html' | 'raw_chat_publication' | 'message' | 'parse_error' | 'raw_non_json' | 'command_error';
   timeISO: string;
-  nickname: string;
-  message: string;
-  messageTime: string;
-  profile: string;
+  channel?: string;
+  nickname?: string;
+  message?: string;
+  messageTime?: string;
+  profile?: string;
   rawProfile?: string;
-  avatar: string;
-  badge: string;
+  avatar?: string;
+  badge?: string;
   classes: string[];
+  text?: string;
+  raw?: unknown;
+  data?: unknown;
+  error?: string;
+  payloadType?: unknown;
 }
 
 let messages: ChatMessage[] = [];
@@ -79,14 +88,54 @@ let token = '';
 
 // Reliability State
 const state = {
+  packets: 0,
+  chatMessages: 0,
+  raws: 0,
+  lastChatText: '',
   lastPacketTime: Date.now(),
+  lastPongTime: Date.now(),
+  lastPingSent: 0,
+  pendingPingId: 0,
+  pendingPingTime: 0,
   lastConnectedTime: 0,
   plannedReconnectAt: 0,
+  plannedReconnectAfter: 0,
   retryCount: 0,
-  isDomainDead: false
+  isDomainDead: false,
+  reconnectReason: ''
 };
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+function getRetryInterval(retries: number) {
+  const jitter = 0.5 * Math.random();
+  const interval = Math.min(MAX_RETRY, MIN_RETRY * (2 ** (retries + 1)));
+  return Math.max(1000, Math.floor((1 - jitter) * interval));
+}
+
+function shortSecret(value: string, count = 10) {
+  const clean = cleanText(value);
+  return clean.length <= count ? clean : `${clean.slice(0, count)}...`;
+}
+
+async function httpGetText(url: string, timeout = 25000) {
+  const response = await axios.get(url, {
+    httpsAgent,
+    timeout,
+    maxRedirects: 5,
+    responseType: 'text',
+    transformResponse: (data) => data,
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    },
+  });
+
+  return {
+    text: String(response.data || ''),
+    finalUrl: response.request?.res?.responseUrl || response.config.url || url,
+  };
+}
 
 async function fetchActualDomain() {
   if (!configState.useAutoMirror && configState.customMirrorUrl) {
@@ -96,133 +145,35 @@ async function fetchActualDomain() {
   }
 
   console.log('Fetching domain from zref.pro...');
-  
-  const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'python-requests/2.31.0',
-    'Mozilla/5.0',
-    ''
-  ];
 
-  let lastError: any = null;
+  const { text: page, finalUrl } = await httpGetText(MIRROR_URL, 25000);
 
-  for (const ua of userAgents) {
-    try {
-      console.log(`Trying domain fetch with User-Agent: "${ua || 'Default'}"`);
-      
-      const config: any = {
-        httpsAgent,
-        timeout: 15000,
-        validateStatus: (status: number) => status < 500
-      };
+  let match = page.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"';\s]+)/i);
 
-      if (ua) {
-        config.headers = {
-          'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        };
-      }
-
-      const response = await axios.get(MIRROR_URL, config);
-      const html = response.data;
-      
-      if (response.status === 403) {
-        console.warn(`Fetch returned 403 status with UA: "${ua}"`);
-        continue; // Try next UA
-      }
-
-      if (typeof html !== 'string') {
-        console.warn('Response is not a string, type is:', typeof html);
-        continue;
-      }
-
-      const finalUrl = response.request?.res?.responseUrl || '';
-      console.log(`Success! Response status: ${response.status}, body size: ${html.length}, final redirect URL: ${finalUrl}`);
-
-      const normalizedFinal = normalizeUrl(finalUrl);
-      const normalizedMirror = normalizeUrl(MIRROR_URL);
-
-      if (normalizedFinal && normalizedFinal !== normalizedMirror && normalizedFinal.startsWith('http')) {
-        return normalizedFinal;
-      }
-
-      // 1. Enhanced Meta Refresh Regex (support more variations including Python-style)
-      let match = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"';\s]+)/i);
-      
-      if (!match) {
-        match = html.match(/content=['"][^'"]*url\s*=\s*([^'"]+)/i);
-      }
-
-      if (!match) {
-        match = html.match(/(?:window\.location|location\.href|location)\s*=\s*['"]([^'"]+)['"]/i);
-      }
-
-      if (!match) {
-        match = html.match(/location\.replace\(['"]([^'"]+)['"]\)/i);
-      }
-
-      if (!match) {
-        match = html.match(/URL\s*=\s*(https?:\/\/[^"'>\s]+)/i);
-      }
-
-      if (match) {
-        let url = match[1].replace(/['"]/g, '').trim();
-        if (!url.startsWith('http')) {
-          try {
-            url = new URL(url, MIRROR_URL).toString();
-          } catch (e) {}
-        }
-        if (url.startsWith('http')) {
-          console.log('Found redirected URL from regex pattern:', url);
-          return url.replace(/\/$/, '');
-        }
-      }
-
-      // Scan HTML for emergency backups
-      const urlRegex = /https?:\/\/[^\s"'<>]+/g;
-      const urls = html.match(urlRegex) || [];
-      for (const u of urls) {
-        if (!u.includes('zref.pro') && !u.includes('w3.org') && !u.includes('schema.org') && !u.includes('google')) {
-          console.log('Emergency fallback: found valid URL inside body:', u);
-          return u.replace(/\/$/, '');
-        }
-      }
-
-      // Check for links
-      const $ = cheerio.load(html);
-      const externalLinks = $('a[href^="http"]').filter((i, el) => {
-        const href = $(el).attr('href');
-        return !!href && !href.includes('zref.pro');
-      });
-
-      if (externalLinks.length > 0) {
-        const link = externalLinks.first().attr('href')!;
-        console.log('Found alternative bridge link in external links:', link);
-        return link.replace(/\/$/, '');
-      }
-
-      if (html.length > 0) {
-        console.warn('HTML Debug (fragment matching failed). Full body is:', html);
-      }
-    } catch (err: any) {
-      console.warn(`Fetch error with UA "${ua}":`, err.message);
-      lastError = err;
-    }
+  if (!match) {
+    match = page.match(/URL\s*=\s*(https?:\/\/[^"'>\s]+)/i);
   }
 
-  throw lastError || new Error('Could not find actual domain using any User-Agent configurations.');
+  if (match) {
+    const siteUrl = normalizeUrl(new URL(match[1].trim(), MIRROR_URL).toString());
+    console.log(`Actual domain: ${siteUrl}`);
+    return siteUrl;
+  }
+
+  if (finalUrl && finalUrl.startsWith('http')) {
+    const siteUrl = normalizeUrl(finalUrl);
+    console.log(`Actual domain: ${siteUrl}`);
+    return siteUrl;
+  }
+
+  throw new Error('Could not find actual domain through zref.pro');
 }
 
-async function fetchCentrifugeConfig() {
-  const baseUrl = await fetchActualDomain();
+async function fetchCentrifugeConfig(forcedBaseUrl?: string) {
+  const baseUrl = forcedBaseUrl ? normalizeUrl(forcedBaseUrl) : await fetchActualDomain();
   console.log('Fetching Centrifugo config from', baseUrl);
-  
-  const response = await axios.get(baseUrl + '/', {
-    httpsAgent,
-    headers: HEADERS,
-    timeout: 25000
-  });
-  const html = response.data;
+
+  const { text: html } = await httpGetText(baseUrl + '/', 25000);
 
   if (!html || html.length < MIN_ALIVE_HTML_SIZE) {
     throw new Error('Response too small or empty');
@@ -235,10 +186,14 @@ async function fetchCentrifugeConfig() {
     throw new Error('Centrifugo config not found in HTML');
   }
 
+  const fetchedWsUrl = cleanText(wsMatch[1]);
+  const fetchedToken = cleanText(tokenMatch[1]);
+  console.log(`Centrifugo config: url=${fetchedWsUrl}, token=${shortSecret(fetchedToken)}`);
+
   return {
     siteBaseUrl: baseUrl,
-    wsUrl: wsMatch[1],
-    token: tokenMatch[1]
+    wsUrl: fetchedWsUrl,
+    token: fetchedToken
   };
 }
 
@@ -255,7 +210,7 @@ function joinUrl(base: string, path: string) {
 
 function parseChatHtml(html: string) {
   const $ = cheerio.load(html);
-  const root = $('.rightBlockChatMessageBlock');
+  const root = $('.rightBlockChatMessageBlock').first();
   if (root.length === 0) return null;
 
   const profileLink = $('a.rightBlockChatAvatarLink, a[href^="/user/"]').first();
@@ -273,7 +228,9 @@ function parseChatHtml(html: string) {
 
   return {
     id: messageId,
+    event: 'chat_message' as const,
     timeISO: new Date().toISOString(),
+    channel: 'chat',
     nickname,
     message,
     messageTime,
@@ -289,10 +246,79 @@ let ws: WebSocket | null = null;
 let io: Server | null = null;
 let pingInterval: NodeJS.Timeout | null = null;
 let watchdogInterval: NodeJS.Timeout | null = null;
+let reconnectTimer: NodeJS.Timeout | null = null;
+let isConnecting = false;
+const intentionallyClosedSockets = new WeakSet<WebSocket>();
+
+function clearConnectionTimers() {
+  if (pingInterval) clearInterval(pingInterval);
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  pingInterval = null;
+  watchdogInterval = null;
+}
+
+function scheduleReconnect(reason: string, delay = getRetryInterval(state.retryCount)) {
+  state.reconnectReason = reason;
+
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+
+  console.log(`[RECONNECT] ${reason}, reconnect in ${(delay / 1000).toFixed(1)}s...`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToCentrifugo();
+  }, delay);
+}
+
+function closeCurrentSocket(reason: string) {
+  state.reconnectReason = reason;
+  if (!ws) return;
+  intentionallyClosedSockets.add(ws);
+  ws.terminate();
+  ws = null;
+}
+
+async function isDomainAlive(baseUrl: string) {
+  try {
+    const host = baseUrl.replace(/^https?:\/\//, '').replace(/\/$/, '').split('/')[0];
+    const checkUrl = `http://${host}`;
+    const response = await axios.get(checkUrl, {
+      timeout: 5000,
+      maxRedirects: 5,
+      responseType: 'arraybuffer',
+      httpsAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      validateStatus: () => true,
+    });
+
+    const size = Buffer.isBuffer(response.data)
+      ? response.data.length
+      : Buffer.byteLength(String(response.data || ''));
+
+    return response.status >= 200 && response.status < 300 && size > MIN_ALIVE_HTML_SIZE;
+  } catch (err: any) {
+    console.log('[DOMAIN CHECK ERROR]', err.message);
+    return false;
+  }
+}
 
 async function connectToCentrifugo() {
+  if (isConnecting) {
+    console.log('Centrifugo connect is already in progress, skipping duplicate call');
+    return;
+  }
+
+  isConnecting = true;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   if (ws) {
-    ws.terminate();
+    closeCurrentSocket('manual_reconnect');
   }
 
   try {
@@ -301,39 +327,56 @@ async function connectToCentrifugo() {
     wsUrl = config.wsUrl;
     token = config.token;
     state.isDomainDead = false;
+    state.reconnectReason = '';
+    state.pendingPingId = 0;
+    state.pendingPingTime = 0;
+    state.lastPacketTime = 0;
+    state.lastPongTime = 0;
+    state.lastConnectedTime = 0;
+    state.plannedReconnectAfter = Math.floor(Math.random() * (PLANNED_RECONNECT_MAX - PLANNED_RECONNECT_MIN) + PLANNED_RECONNECT_MIN);
     io?.emit('active_domain', siteBaseUrl);
-  } catch (err) {
-    console.error('Failed to get config, retrying in 10s...');
-    setTimeout(connectToCentrifugo, 10000);
+  } catch (err: any) {
+    console.error('Failed to get config:', err.message);
+    const delay = getRetryInterval(state.retryCount);
+    state.retryCount = Math.min(state.retryCount + 1, 10);
+    isConnecting = false;
+    scheduleReconnect('config_fetch_failed', delay);
     return;
   }
 
   console.log('Connecting to Centrifugo:', wsUrl);
-  ws = new WebSocket(wsUrl, {
+  const socket = new WebSocket(wsUrl, {
     headers: {
       'Origin': siteBaseUrl,
       'User-Agent': 'Mozilla/5.0'
     },
     rejectUnauthorized: false
   });
+  ws = socket;
 
   let messageId = 1;
+  let connectId = 0;
+  let connected = false;
   state.lastConnectedTime = Date.now();
   state.lastPacketTime = Date.now();
-  state.plannedReconnectAt = Date.now() + Math.floor(Math.random() * (PLANNED_RECONNECT_MAX - PLANNED_RECONNECT_MIN) + PLANNED_RECONNECT_MIN);
+  state.lastPongTime = Date.now();
+  state.plannedReconnectAt = Date.now() + state.plannedReconnectAfter;
 
-  ws.on('open', () => {
+  socket.on('open', () => {
     console.log('Connected to Centrifugo WS');
+    isConnecting = false;
     state.retryCount = 0;
-    ws?.send(JSON.stringify({
-      id: messageId++,
+    connectId = messageId++;
+    socket.send(JSON.stringify({
+      id: connectId,
       method: METHOD_CONNECT,
       params: { token }
     }));
   });
 
-  ws.on('message', (data) => {
+  socket.on('message', (data) => {
     state.lastPacketTime = Date.now();
+    state.packets += 1;
     const raw = data.toString();
     const lines = raw.split('\n').filter(l => l.trim());
     
@@ -341,12 +384,47 @@ async function connectToCentrifugo() {
       try {
         const packet = JSON.parse(line);
 
-        if (packet.id === 1 && !packet.error) {
-          ws?.send(JSON.stringify({
+        if (packet.id === connectId) {
+          if (packet.error) {
+            throw new Error(`CONNECT ERROR: ${JSON.stringify(packet.error)}`);
+          }
+
+          connected = true;
+          const client = packet.result?.client || '';
+          console.log('[OK] Centrifuge connected', client);
+
+          socket.send(JSON.stringify({
             id: messageId++,
             method: METHOD_SUBSCRIBE,
             params: { channel: 'chat' }
           }));
+          console.log('[OK] subscribed: chat');
+          continue;
+        }
+
+        if (packet.id) {
+          if (packet.id === state.pendingPingId) {
+            state.pendingPingId = 0;
+            state.pendingPingTime = 0;
+            state.lastPongTime = Date.now();
+            continue;
+          }
+
+          if (packet.error) {
+            const item: ChatMessage = {
+              id: `command-error-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+              event: 'command_error',
+              timeISO: new Date().toISOString(),
+              classes: [],
+              raw: packet.error,
+            };
+            messages.push(item);
+            if (messages.length > MAX_MESSAGES) messages.shift();
+            state.raws += 1;
+            io?.emit('chat_message', item);
+            console.log('[COMMAND ERROR]', packet.error);
+          }
+          continue;
         }
 
         const result = packet.result;
@@ -357,49 +435,135 @@ async function connectToCentrifugo() {
             if (parsed) {
               messages.push(parsed);
               if (messages.length > MAX_MESSAGES) messages.shift();
+              state.chatMessages += 1;
+              state.lastChatText = `${parsed.messageTime || '--:--'} | ${parsed.nickname || 'unknown'}: ${parsed.message || ''}`.slice(0, 200);
               io?.emit('chat_message', parsed);
+              console.log(`[CHAT] ${parsed.messageTime || '--:--'} | ${parsed.nickname || 'unknown'}: ${parsed.message || ''}`);
+            } else {
+              const rawItem: ChatMessage = {
+                id: `raw-chat-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                event: 'raw_chat_html',
+                timeISO: new Date().toISOString(),
+                channel: 'chat',
+                classes: [],
+                raw: publicationData,
+              };
+              messages.push(rawItem);
+              if (messages.length > MAX_MESSAGES) messages.shift();
+              state.raws += 1;
+              io?.emit('chat_message', rawItem);
             }
+          } else {
+            const rawItem: ChatMessage = {
+              id: `raw-publication-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+              event: 'raw_chat_publication',
+              timeISO: new Date().toISOString(),
+              channel: 'chat',
+              classes: [],
+              raw: publicationData,
+            };
+            messages.push(rawItem);
+            if (messages.length > MAX_MESSAGES) messages.shift();
+            state.raws += 1;
+            io?.emit('chat_message', rawItem);
           }
+        } else if (result && result.type === PUSH_MESSAGE) {
+          const item: ChatMessage = {
+            id: `message-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            event: 'message',
+            timeISO: new Date().toISOString(),
+            channel: result.channel,
+            classes: [],
+            data: result.data,
+          };
+          messages.push(item);
+          if (messages.length > MAX_MESSAGES) messages.shift();
+          state.raws += 1;
+          io?.emit('chat_message', item);
         }
-      } catch (err) {}
+      } catch (err: any) {
+        const item: ChatMessage = {
+          id: `parse-error-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          event: 'parse_error',
+          timeISO: new Date().toISOString(),
+          classes: [],
+          error: err.message,
+          raw: line,
+        };
+        messages.push(item);
+        if (messages.length > MAX_MESSAGES) messages.shift();
+        state.raws += 1;
+        io?.emit('chat_message', item);
+        console.log('[PARSE ERROR]', err.message);
+      }
     }
   });
 
-  ws.on('error', (err) => {
+  socket.on('error', (err) => {
     console.error('Centrifugo WS Error:', err.message);
   });
 
-  ws.on('close', () => {
+  socket.on('close', () => {
+    isConnecting = false;
+    clearConnectionTimers();
+
+    if (ws === socket) {
+      ws = null;
+    }
+
+    if (intentionallyClosedSockets.has(socket)) {
+      console.log('Centrifugo WS closed intentionally');
+      return;
+    }
+
+    if (!connected) {
+      state.reconnectReason = 'closed_before_connect';
+    }
+
     console.log('Centrifugo WS Closed. Reconnecting...');
-    if (pingInterval) clearInterval(pingInterval);
-    if (watchdogInterval) clearInterval(watchdogInterval);
-    
-    const delay = Math.min(30000, 1000 * Math.pow(2, state.retryCount++));
-    setTimeout(connectToCentrifugo, delay);
+    const delay = getRetryInterval(state.retryCount);
+    state.retryCount = Math.min(state.retryCount + 1, 10);
+    scheduleReconnect(state.reconnectReason || 'socket_closed', delay);
   });
 
   // Ping loop
   pingInterval = setInterval(() => {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ id: messageId++, method: METHOD_PING }));
+    if (socket.readyState === WebSocket.OPEN && connected) {
+      const pingId = messageId++;
+      state.pendingPingId = pingId;
+      state.pendingPingTime = Date.now();
+      state.lastPingSent = Date.now();
+      socket.send(JSON.stringify({ id: pingId, method: METHOD_PING }));
     }
   }, 25000);
 
   // Watchdog loop
   watchdogInterval = setInterval(() => {
     const now = Date.now();
+
+    if (socket.readyState !== WebSocket.OPEN) return;
+
+    // PONG check
+    if (state.pendingPingTime && now - state.pendingPingTime >= PONG_TIMEOUT) {
+      console.log(`[WATCHDOG] No PONG for ${PONG_TIMEOUT / 1000}s, reconnecting...`);
+      state.reconnectReason = 'ping_timeout';
+      socket.terminate();
+      return;
+    }
     
     // Silent socket check
     if (now - state.lastPacketTime > SILENT_SOCKET_TIMEOUT) {
-      console.log('Watchdog: Socket silent, forcing reconnect...');
-      ws?.terminate();
+      console.log(`[WATCHDOG] No packets for ${SILENT_SOCKET_TIMEOUT / 1000}s, reconnecting...`);
+      state.reconnectReason = 'silent_socket';
+      socket.terminate();
       return;
     }
 
     // Planned reconnect
     if (now > state.plannedReconnectAt) {
-      console.log('Watchdog: Planned reconnect...');
-      ws?.terminate();
+      console.log(`[WATCHDOG] Planned reconnect after ${Math.round(state.plannedReconnectAfter / 1000)}s, reconnecting...`);
+      state.reconnectReason = 'planned_refresh';
+      socket.terminate();
       return;
     }
   }, 10000);
@@ -409,18 +573,33 @@ async function connectToCentrifugo() {
 setInterval(async () => {
   if (!siteBaseUrl) return;
   try {
-    const freshDomain = await fetchActualDomain();
-    if (freshDomain !== siteBaseUrl) {
-      console.log('Mirror changed:', siteBaseUrl, '->', freshDomain);
-      ws?.terminate();
+    const alive = await isDomainAlive(siteBaseUrl);
+    if (alive) return;
+
+    console.log('[DOMAIN DEAD]', siteBaseUrl);
+    state.isDomainDead = true;
+    state.reconnectReason = 'domain_dead';
+
+    if (ws) {
+      ws.terminate();
+    } else {
+      scheduleReconnect('domain_dead', getRetryInterval(state.retryCount));
     }
-  } catch (e) {}
+  } catch (e: any) {
+    console.log('[DOMAIN CHECK ERROR]', e.message);
+  }
 }, DOMAIN_CHECK_INTERVAL);
 
 // Status logging loop
 setInterval(() => {
-  const wsStatus = ws?.readyState === WebSocket.OPEN ? 'OK' : (ws?.readyState === WebSocket.CONNECTING ? 'Connecting' : 'Closed');
-  console.log(`[STATUS] WS: ${wsStatus}, Messages: ${messages.length}, Mirror: ${siteBaseUrl || 'None'}, Retry: ${state.retryCount}`);
+  const wsStatus = ws?.readyState === WebSocket.OPEN ? 'ok' : (ws?.readyState === WebSocket.CONNECTING ? 'connecting' : 'нет подключения');
+  const packetAge = state.lastPacketTime ? Math.floor((Date.now() - state.lastPacketTime) / 1000) : 0;
+  const pongAge = state.lastPongTime ? Math.floor((Date.now() - state.lastPongTime) / 1000) : 0;
+  console.log(
+    `[STATUS] ws=${wsStatus}; domain=${siteBaseUrl || 'нет домена'}; ` +
+    `packets=${state.packets}; chat=${state.chatMessages}; raw=${state.raws}; ` +
+    `last=${state.lastChatText || 'пока не было'}; packet_age=${packetAge}s; pong_age=${pongAge}s`
+  );
 }, 60000);
 
 app.prepare().then(async () => {
@@ -477,11 +656,7 @@ app.prepare().then(async () => {
     // Reconnect to Centrifugo if mirror settings changed
     if (prevUseAuto !== configState.useAutoMirror || prevCustomUrl !== configState.customMirrorUrl) {
       console.log('Mirror configuration changed. Recalculating domain connection...');
-      try {
-        connectToCentrifugo();
-      } catch (err: any) {
-        console.error('Reconnection to custom Centrifugo failed:', err.message);
-      }
+      connectToCentrifugo();
     }
 
     res.json({ success: true, config: configState });
@@ -493,9 +668,11 @@ app.prepare().then(async () => {
       console.log('Received manual mirror override:', customMirror);
       siteBaseUrl = customMirror;
       try {
-        const config = await fetchCentrifugeConfig();
+        const config = await fetchCentrifugeConfig(customMirror);
         wsUrl = config.wsUrl;
         token = config.token;
+        configState.useAutoMirror = false;
+        configState.customMirrorUrl = normalizeUrl(customMirror);
         connectToCentrifugo();
         return res.json({ success: true, siteBaseUrl, wsUrl });
       } catch (e: any) {
