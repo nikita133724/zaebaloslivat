@@ -8,16 +8,33 @@ import * as cheerio from 'cheerio';
 import https from 'https';
 import { formatISO } from 'date-fns';
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Configuration
 const MIRROR_URL = 'https://zref.pro';
-const TARGET_USER = '/user/124646';
+
+const normalizeUrl = (u: string) => u ? u.replace(/\/$/, '').trim() : '';
 const MAX_MESSAGES = 100;
+
+export interface AppConfigState {
+  targetUserId: string;
+  useAutoMirror: boolean;
+  customMirrorUrl: string;
+  onlyTargetUser: boolean;
+}
+
+const configState: AppConfigState = {
+  targetUserId: '25945',
+  useAutoMirror: true,
+  customMirrorUrl: '',
+  onlyTargetUser: true,
+};
 
 // Watchdog / Reliability constants (from Python)
 const PONG_TIMEOUT = 90000;
@@ -49,6 +66,7 @@ interface ChatMessage {
   message: string;
   messageTime: string;
   profile: string;
+  rawProfile?: string;
   avatar: string;
   badge: string;
   classes: string[];
@@ -71,100 +89,128 @@ const state = {
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 async function fetchActualDomain() {
+  if (!configState.useAutoMirror && configState.customMirrorUrl) {
+    const manualUrl = normalizeUrl(configState.customMirrorUrl);
+    console.log('Using manual custom domain override:', manualUrl);
+    return manualUrl;
+  }
+
   console.log('Fetching domain from zref.pro...');
-  try {
-    const response = await axios.get(MIRROR_URL, {
-      httpsAgent,
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      },
-      maxRedirects: 10,
-      timeout: 30000,
-      validateStatus: (status) => status < 500
-    });
-    
-    const html = response.data;
-    if (typeof html !== 'string') {
-      console.warn('Response is not a string, type is:', typeof html);
-      throw new Error('Response is not HTML string');
-    }
+  
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'python-requests/2.31.0',
+    'Mozilla/5.0',
+    ''
+  ];
 
-    const finalUrl = response.request?.res?.responseUrl || '';
-    console.log(`Initial domain fetch response status: ${response.status}, body size: ${html.length}, final redirect URL: ${finalUrl}`);
+  let lastError: any = null;
 
-    // If Axios finished on a different domain, automatically treat it as the actual domain
-    if (finalUrl && finalUrl !== MIRROR_URL && finalUrl.startsWith('http')) {
-      return finalUrl.replace(/\/$/, '');
-    }
+  for (const ua of userAgents) {
+    try {
+      console.log(`Trying domain fetch with User-Agent: "${ua || 'Default'}"`);
+      
+      const config: any = {
+        httpsAgent,
+        timeout: 15000,
+        validateStatus: (status: number) => status < 500
+      };
 
-    // 1. Enhanced Meta Refresh Regex (support more variations including Python-style)
-    let match = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"';\s]+)/i);
-    
-    // 2. Simple content-url pattern
-    if (!match) {
+      if (ua) {
+        config.headers = {
+          'User-Agent': ua,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        };
+      }
+
+      const response = await axios.get(MIRROR_URL, config);
+      const html = response.data;
+      
+      if (response.status === 403) {
+        console.warn(`Fetch returned 403 status with UA: "${ua}"`);
+        continue; // Try next UA
+      }
+
+      if (typeof html !== 'string') {
+        console.warn('Response is not a string, type is:', typeof html);
+        continue;
+      }
+
+      const finalUrl = response.request?.res?.responseUrl || '';
+      console.log(`Success! Response status: ${response.status}, body size: ${html.length}, final redirect URL: ${finalUrl}`);
+
+      const normalizedFinal = normalizeUrl(finalUrl);
+      const normalizedMirror = normalizeUrl(MIRROR_URL);
+
+      if (normalizedFinal && normalizedFinal !== normalizedMirror && normalizedFinal.startsWith('http')) {
+        return normalizedFinal;
+      }
+
+      // 1. Enhanced Meta Refresh Regex (support more variations including Python-style)
+      let match = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"';\s]+)/i);
+      
+      if (!match) {
         match = html.match(/content=['"][^'"]*url\s*=\s*([^'"]+)/i);
-    }
-
-    // 3. JS Redirect Detection (window.location, location.href, location.replace)
-    if (!match) {
-      match = html.match(/(?:window\.location|location\.href|location)\s*=\s*['"]([^'"]+)['"]/i);
-    }
-
-    // 4. Look for location.replace('...') or location.replace("...")
-    if (!match) {
-      match = html.match(/location\.replace\(['"]([^'"]+)['"]\)/i);
-    }
-
-    // 5. Look for the pattern URL=... (from user's python code)
-    if (!match) {
-      match = html.match(/URL\s*=\s*(https?:\/\/[^"'>\s]+)/i);
-    }
-
-    if (match) {
-      let url = match[1].replace(/['"]/g, '').trim();
-      if (!url.startsWith('http')) {
-        try {
-          url = new URL(url, MIRROR_URL).toString();
-        } catch (e) {}
       }
-      if (url.startsWith('http')) {
-        console.log('Found redirected URL from regex pattern:', url);
-        return url.replace(/\/$/, '');
-      }
-    }
 
-    // 6. Generic emergency backup finder: scan the HTML response for any absolute URL that isn't zref.pro, w3, etc.
-    const urlRegex = /https?:\/\/[^\s"'<>]+/g;
-    const urls = html.match(urlRegex) || [];
-    for (const u of urls) {
-      if (!u.includes('zref.pro') && !u.includes('w3.org') && !u.includes('schema.org') && !u.includes('google')) {
-        console.log('Emergency fallback: found a valid target URL inside body:', u);
-        return u.replace(/\/$/, '');
+      if (!match) {
+        match = html.match(/(?:window\.location|location\.href|location)\s*=\s*['"]([^'"]+)['"]/i);
       }
-    }
 
-    // Check for bridges (if page contains a link to another site)
-    const $ = cheerio.load(html);
-    const externalLinks = $('a[href^="http"]').filter((i, el) => {
+      if (!match) {
+        match = html.match(/location\.replace\(['"]([^'"]+)['"]\)/i);
+      }
+
+      if (!match) {
+        match = html.match(/URL\s*=\s*(https?:\/\/[^"'>\s]+)/i);
+      }
+
+      if (match) {
+        let url = match[1].replace(/['"]/g, '').trim();
+        if (!url.startsWith('http')) {
+          try {
+            url = new URL(url, MIRROR_URL).toString();
+          } catch (e) {}
+        }
+        if (url.startsWith('http')) {
+          console.log('Found redirected URL from regex pattern:', url);
+          return url.replace(/\/$/, '');
+        }
+      }
+
+      // Scan HTML for emergency backups
+      const urlRegex = /https?:\/\/[^\s"'<>]+/g;
+      const urls = html.match(urlRegex) || [];
+      for (const u of urls) {
+        if (!u.includes('zref.pro') && !u.includes('w3.org') && !u.includes('schema.org') && !u.includes('google')) {
+          console.log('Emergency fallback: found valid URL inside body:', u);
+          return u.replace(/\/$/, '');
+        }
+      }
+
+      // Check for links
+      const $ = cheerio.load(html);
+      const externalLinks = $('a[href^="http"]').filter((i, el) => {
         const href = $(el).attr('href');
         return !!href && !href.includes('zref.pro');
-    });
+      });
 
-    if (externalLinks.length > 0) {
+      if (externalLinks.length > 0) {
         const link = externalLinks.first().attr('href')!;
         console.log('Found alternative bridge link in external links:', link);
         return link.replace(/\/$/, '');
-    }
+      }
 
-    if (html.length > 50) {
-        console.warn('HTML Debug (fragment matching failed):', html.substring(0, 500));
+      if (html.length > 0) {
+        console.warn('HTML Debug (fragment matching failed). Full body is:', html);
+      }
+    } catch (err: any) {
+      console.warn(`Fetch error with UA "${ua}":`, err.message);
+      lastError = err;
     }
-    throw new Error(`Could not find actual domain. Body size: ${html.length}`);
-  } catch (err: any) {
-    console.error('Error fetching domain:', err.message);
-    throw err;
   }
+
+  throw lastError || new Error('Could not find actual domain using any User-Agent configurations.');
 }
 
 async function fetchCentrifugeConfig() {
@@ -215,23 +261,24 @@ function parseChatHtml(html: string) {
   const profileLink = $('a.rightBlockChatAvatarLink, a[href^="/user/"]').first();
   const rawProfile = profileLink.attr('href') || '';
   
-  // We only care about TARGET_USER
-  if (rawProfile !== TARGET_USER) return null;
-
-  const nickname = cleanText($('.rightBlockChatMessageNick').text());
+  const nickEl = $('.rightBlockChatMessageNick');
+  const nickname = cleanText(nickEl.attr('data-chat-quote-name') || nickEl.text());
   const message = cleanText($('.rightBlockChatMessageText').text());
   const messageTime = cleanText($('.rightBlockChatMessageTimeBlock').text());
   const rawAvatar = $('img').first().attr('src') || '';
   const badge = cleanText($('.rightBlockHeaderAvatarFlag').text());
   const classes = (root.attr('class') || '').split(/\s+/).filter(Boolean);
 
+  const messageId = root.attr('data-message-id') || Math.random().toString(36).substring(7);
+
   return {
-    id: Math.random().toString(36).substring(7),
+    id: messageId,
     timeISO: new Date().toISOString(),
     nickname,
     message,
     messageTime,
     profile: joinUrl(siteBaseUrl, rawProfile),
+    rawProfile,
     avatar: joinUrl(siteBaseUrl, rawAvatar),
     badge,
     classes
@@ -254,6 +301,7 @@ async function connectToCentrifugo() {
     wsUrl = config.wsUrl;
     token = config.token;
     state.isDomainDead = false;
+    io?.emit('active_domain', siteBaseUrl);
   } catch (err) {
     console.error('Failed to get config, retrying in 10s...');
     setTimeout(connectToCentrifugo, 10000);
@@ -390,6 +438,8 @@ app.prepare().then(async () => {
   io.on('connection', (socket) => {
     console.log('New client connected');
     socket.emit('init_messages', messages);
+    socket.emit('active_domain', siteBaseUrl);
+    socket.emit('config_update', configState);
     
     socket.on('disconnect', () => {
       console.log('Client disconnected');
@@ -401,7 +451,69 @@ app.prepare().then(async () => {
     res.json({ time: new Date().toISOString() });
   });
 
-  server.all('*', (req, res) => {
+  // Allowed manual configuration input from frontend
+  server.use(express.json());
+
+  server.get('/api/domen-settings', (req, res) => {
+    res.json(configState);
+  });
+
+  server.post('/api/domen-settings', async (req, res) => {
+    const { targetUserId, useAutoMirror, customMirrorUrl, onlyTargetUser } = req.body;
+    
+    const prevUseAuto = configState.useAutoMirror;
+    const prevCustomUrl = configState.customMirrorUrl;
+
+    if (typeof targetUserId === 'string') configState.targetUserId = targetUserId.trim();
+    if (typeof useAutoMirror === 'boolean') configState.useAutoMirror = useAutoMirror;
+    if (typeof customMirrorUrl === 'string') configState.customMirrorUrl = customMirrorUrl.trim();
+    if (typeof onlyTargetUser === 'boolean') configState.onlyTargetUser = onlyTargetUser;
+
+    console.log('Updated configuration settings:', configState);
+
+    // Notify all active clients in real-time
+    io?.emit('config_update', configState);
+
+    // Reconnect to Centrifugo if mirror settings changed
+    if (prevUseAuto !== configState.useAutoMirror || prevCustomUrl !== configState.customMirrorUrl) {
+      console.log('Mirror configuration changed. Recalculating domain connection...');
+      try {
+        connectToCentrifugo();
+      } catch (err: any) {
+        console.error('Reconnection to custom Centrifugo failed:', err.message);
+      }
+    }
+
+    res.json({ success: true, config: configState });
+  });
+
+  server.post('/api/config', async (req, res) => {
+    const { customMirror, customWsUrl, customToken } = req.body;
+    if (customMirror) {
+      console.log('Received manual mirror override:', customMirror);
+      siteBaseUrl = customMirror;
+      try {
+        const config = await fetchCentrifugeConfig();
+        wsUrl = config.wsUrl;
+        token = config.token;
+        connectToCentrifugo();
+        return res.json({ success: true, siteBaseUrl, wsUrl });
+      } catch (e: any) {
+        return res.status(400).json({ success: false, error: e.message });
+      }
+    }
+    if (customWsUrl && customToken) {
+      console.log('Received manual centrifuge config override');
+      wsUrl = customWsUrl;
+      token = customToken;
+      if (customMirror) siteBaseUrl = customMirror;
+      connectToCentrifugo();
+      return res.json({ success: true, wsUrl });
+    }
+    res.status(400).json({ error: 'Invalid config' });
+  });
+
+  server.all(/.*/, (req, res) => {
     return handle(req, res);
   });
 
