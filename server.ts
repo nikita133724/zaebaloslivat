@@ -1,424 +1,523 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Chat Monitor</title>
-    <meta charset="utf-8">
-    <style>
-        * { box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; 
-            padding: 20px; 
-            background: #0f0f1a; 
-            color: #e0e0e0;
-            margin: 0;
-        }
-        .container { max-width: 1200px; margin: 0 auto; }
-        
-        /* Stats panel */
-        .stats-panel {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-            display: flex;
-            gap: 30px;
-            flex-wrap: wrap;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        }
-        .stat {
-            flex: 1;
-            min-width: 120px;
-            text-align: center;
-            padding: 10px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 8px;
-        }
-        .stat-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #4ecdc4; }
-        .stat-value.connected { color: #4ecdc4; }
-        .stat-value.disconnected { color: #ff6b6b; }
-        
-        /* Search */
-        .search-box {
-            background: #1a1a2e;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 20px;
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-        .search-box input {
-            flex: 1;
-            padding: 10px 15px;
-            background: #0f0f1a;
-            border: 1px solid #2a2a3e;
-            border-radius: 6px;
-            color: #e0e0e0;
-            font-size: 14px;
-        }
-        .search-box button {
-            padding: 10px 20px;
-            background: #4ecdc4;
-            border: none;
-            border-radius: 6px;
-            color: #1a1a2e;
-            font-weight: bold;
-            cursor: pointer;
-        }
-        .search-box button:hover { opacity: 0.9; }
-        
-        /* Tabs */
-        .tabs {
-            display: flex;
-            gap: 5px;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #2a2a3e;
-        }
-        .tab {
-            padding: 10px 20px;
-            background: none;
-            border: none;
-            color: #888;
-            cursor: pointer;
-            font-size: 14px;
-        }
-        .tab.active {
-            color: #4ecdc4;
-            border-bottom: 2px solid #4ecdc4;
-        }
-        
-        /* Chat messages */
-        .chat-container {
-            background: #1a1a2e;
-            border-radius: 12px;
-            overflow: hidden;
-        }
-        .messages {
-            height: 500px;
-            overflow-y: auto;
-            padding: 15px;
-            display: flex;
-            flex-direction: column-reverse;
-        }
-        .message {
-            padding: 8px 12px;
-            border-bottom: 1px solid #2a2a3e;
-            font-size: 13px;
-        }
-        .message:hover { background: #22223b; }
-        .message-rain {
-            background: #2a1a3e;
-            border-left: 3px solid #ff6b6b;
-        }
-        .time { color: #666; font-size: 11px; margin-right: 10px; }
-        .nick { 
-            color: #4ecdc4; 
-            font-weight: bold;
-            cursor: pointer;
-        }
-        .nick:hover { text-decoration: underline; }
-        .status-vip { color: #ffd700; font-size: 10px; margin-left: 5px; }
-        .status-admin { color: #ff6b6b; font-size: 10px; margin-left: 5px; }
-        .text { color: #e0e0e0; word-break: break-word; }
-        .rain-icon { color: #ff6b6b; margin-right: 5px; }
-        
-        /* Users list */
-        .users-list {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        .user-item {
-            padding: 10px;
-            border-bottom: 1px solid #2a2a3e;
-            cursor: pointer;
-        }
-        .user-item:hover { background: #22223b; }
-        .user-nick { font-weight: bold; color: #4ecdc4; }
-        .user-status { font-size: 10px; color: #888; }
-        .user-last { font-size: 11px; color: #666; margin-top: 4px; }
-        
-        /* User messages */
-        .user-messages {
-            margin-top: 20px;
-            border-top: 1px solid #2a2a3e;
-            padding-top: 15px;
-        }
-        .back-btn {
-            background: #2a2a3e;
-            border: none;
-            color: #e0e0e0;
-            padding: 5px 10px;
-            border-radius: 6px;
-            cursor: pointer;
-            margin-bottom: 10px;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="stats-panel">
-        <div class="stat">
-            <div class="stat-label">Статус</div>
-            <div class="stat-value" id="wsStatus">⏳</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">Домен</div>
-            <div class="stat-value" id="domain" style="font-size: 14px;">-</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">Сообщений</div>
-            <div class="stat-value" id="msgCount">0</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">Дождей</div>
-            <div class="stat-value" id="rainCount">0</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">Пакетов</div>
-            <div class="stat-value" id="packets">0</div>
-        </div>
-    </div>
-    
-    <div class="search-box">
-        <input type="text" id="userSearch" placeholder="Поиск по нику или ID пользователя...">
-        <button onclick="searchUser()">Найти</button>
-    </div>
-    
-    <div class="tabs">
-        <button class="tab active" onclick="showTab('chat')">💬 Чат</button>
-        <button class="tab" onclick="showTab('users')">👥 Пользователи</button>
-        <button class="tab" onclick="showTab('rains')">🌧️ Дожди</button>
-    </div>
-    
-    <div id="chatTab" class="chat-container">
-        <div class="messages" id="messages"></div>
-    </div>
-    
-    <div id="usersTab" style="display: none;">
-        <div class="users-list" id="usersList"></div>
-        <div id="userMessagesPanel" style="display: none;">
-            <button class="back-btn" onclick="closeUserMessages()">← Назад к списку</button>
-            <div class="chat-container">
-                <div class="messages" id="userMessages"></div>
-            </div>
-        </div>
-    </div>
-    
-    <div id="rainsTab" style="display: none;">
-        <div class="messages" id="rainsList" style="height: 400px; overflow-y: auto;"></div>
-    </div>
-</div>
+import express from 'express';
+import next from 'next';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import WebSocket from 'ws';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import https from 'https';
+import { formatISO } from 'date-fns';
 
-<script>
-    let currentUser = null;
-    let messages = [];
-    let rains = [];
-    
-    const eventSource = new EventSource('/events');
-    
-    eventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        
-        if (data.type === 'status') {
-            updateStatus(data.data);
-        } else if (data.type === 'message') {
-            addMessage(data.data);
-        } else if (data.type === 'rain') {
-            addRain(data.data);
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const dev = process.env.NODE_ENV !== 'production';
+const app = next({ dev });
+const handle = app.getRequestHandler();
+
+const PORT = Number(process.env.PORT) || 3000;
+
+// Configuration
+const MIRROR_URL = 'https://zref.pro';
+
+const normalizeUrl = (u: string) => u ? u.replace(/\/$/, '').trim() : '';
+const MAX_MESSAGES = 100;
+
+export interface AppConfigState {
+  targetUserId: string;
+  useAutoMirror: boolean;
+  customMirrorUrl: string;
+  onlyTargetUser: boolean;
+}
+
+const configState: AppConfigState = {
+  targetUserId: '25945',
+  useAutoMirror: true,
+  customMirrorUrl: '',
+  onlyTargetUser: true,
+};
+
+// Watchdog / Reliability constants (from Python)
+const PONG_TIMEOUT = 90000;
+const SILENT_SOCKET_TIMEOUT = 240000;
+const DOMAIN_CHECK_INTERVAL = 60000;
+const PLANNED_RECONNECT_MIN = 3600000;
+const PLANNED_RECONNECT_MAX = 5400000;
+const MIN_ALIVE_HTML_SIZE = 1000;
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+};
+
+// Centrifuge Constants
+const METHOD_CONNECT = 0;
+const METHOD_SUBSCRIBE = 1;
+const METHOD_PING = 7;
+
+const PUSH_PUBLICATION = 0;
+
+interface ChatMessage {
+  id: string;
+  timeISO: string;
+  nickname: string;
+  message: string;
+  messageTime: string;
+  profile: string;
+  rawProfile?: string;
+  avatar: string;
+  badge: string;
+  classes: string[];
+}
+
+let messages: ChatMessage[] = [];
+let siteBaseUrl = '';
+let wsUrl = '';
+let token = '';
+
+// Reliability State
+const state = {
+  lastPacketTime: Date.now(),
+  lastConnectedTime: 0,
+  plannedReconnectAt: 0,
+  retryCount: 0,
+  isDomainDead: false
+};
+
+const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+async function fetchActualDomain() {
+  if (!configState.useAutoMirror && configState.customMirrorUrl) {
+    const manualUrl = normalizeUrl(configState.customMirrorUrl);
+    console.log('Using manual custom domain override:', manualUrl);
+    return manualUrl;
+  }
+
+  console.log('Fetching domain from zref.pro...');
+  
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'python-requests/2.31.0',
+    'Mozilla/5.0',
+    ''
+  ];
+
+  let lastError: any = null;
+
+  for (const ua of userAgents) {
+    try {
+      console.log(`Trying domain fetch with User-Agent: "${ua || 'Default'}"`);
+      
+      const config: any = {
+        httpsAgent,
+        timeout: 15000,
+        validateStatus: (status: number) => status < 500
+      };
+
+      if (ua) {
+        config.headers = {
+          'User-Agent': ua,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        };
+      }
+
+      const response = await axios.get(MIRROR_URL, config);
+      const html = response.data;
+      
+      if (response.status === 403) {
+        console.warn(`Fetch returned 403 status with UA: "${ua}"`);
+        continue; // Try next UA
+      }
+
+      if (typeof html !== 'string') {
+        console.warn('Response is not a string, type is:', typeof html);
+        continue;
+      }
+
+      const finalUrl = response.request?.res?.responseUrl || '';
+      console.log(`Success! Response status: ${response.status}, body size: ${html.length}, final redirect URL: ${finalUrl}`);
+
+      const normalizedFinal = normalizeUrl(finalUrl);
+      const normalizedMirror = normalizeUrl(MIRROR_URL);
+
+      if (normalizedFinal && normalizedFinal !== normalizedMirror && normalizedFinal.startsWith('http')) {
+        return normalizedFinal;
+      }
+
+      // 1. Enhanced Meta Refresh Regex (support more variations including Python-style)
+      let match = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url\s*=\s*([^"';\s]+)/i);
+      
+      if (!match) {
+        match = html.match(/content=['"][^'"]*url\s*=\s*([^'"]+)/i);
+      }
+
+      if (!match) {
+        match = html.match(/(?:window\.location|location\.href|location)\s*=\s*['"]([^'"]+)['"]/i);
+      }
+
+      if (!match) {
+        match = html.match(/location\.replace\(['"]([^'"]+)['"]\)/i);
+      }
+
+      if (!match) {
+        match = html.match(/URL\s*=\s*(https?:\/\/[^"'>\s]+)/i);
+      }
+
+      if (match) {
+        let url = match[1].replace(/['"]/g, '').trim();
+        if (!url.startsWith('http')) {
+          try {
+            url = new URL(url, MIRROR_URL).toString();
+          } catch (e) {}
         }
-    };
-    
-    function updateStatus(statusData) {
-        const wsSpan = document.getElementById('wsStatus');
-        wsSpan.textContent = statusData.connected ? '✅' : '❌';
-        wsSpan.className = `stat-value ${statusData.connected ? 'connected' : 'disconnected'}`;
-        
-        document.getElementById('domain').textContent = statusData.domain || '-';
-        if (statusData.stats) {
-            document.getElementById('msgCount').textContent = statusData.stats.chat_messages || 0;
-            document.getElementById('rainCount').textContent = statusData.stats.rains || 0;
-            document.getElementById('packets').textContent = statusData.stats.packets || 0;
+        if (url.startsWith('http')) {
+          console.log('Found redirected URL from regex pattern:', url);
+          return url.replace(/\/$/, '');
         }
-    }
-    
-    function addMessage(msg) {
-        const messagesDiv = document.getElementById('messages');
-        const div = createMessageElement(msg);
-        messagesDiv.insertBefore(div, messagesDiv.firstChild);
-        
-        // Ограничиваем количество сообщений
-        while (messagesDiv.children.length > 500) {
-            messagesDiv.removeChild(messagesDiv.lastChild);
+      }
+
+      // Scan HTML for emergency backups
+      const urlRegex = /https?:\/\/[^\s"'<>]+/g;
+      const urls = html.match(urlRegex) || [];
+      for (const u of urls) {
+        if (!u.includes('zref.pro') && !u.includes('w3.org') && !u.includes('schema.org') && !u.includes('google')) {
+          console.log('Emergency fallback: found valid URL inside body:', u);
+          return u.replace(/\/$/, '');
         }
-        
-        // Если открыты сообщения пользователя
-        if (currentUser && (msg.userId === currentUser.userId || msg.nickname === currentUser.nickname)) {
-            const userMessagesDiv = document.getElementById('userMessages');
-            const userDiv = createMessageElement(msg);
-            userMessagesDiv.insertBefore(userDiv, userMessagesDiv.firstChild);
+      }
+
+      // Check for links
+      const $ = cheerio.load(html);
+      const externalLinks = $('a[href^="http"]').filter((i, el) => {
+        const href = $(el).attr('href');
+        return !!href && !href.includes('zref.pro');
+      });
+
+      if (externalLinks.length > 0) {
+        const link = externalLinks.first().attr('href')!;
+        console.log('Found alternative bridge link in external links:', link);
+        return link.replace(/\/$/, '');
+      }
+
+      if (html.length > 0) {
+        console.warn('HTML Debug (fragment matching failed). Full body is:', html);
+      }
+    } catch (err: any) {
+      console.warn(`Fetch error with UA "${ua}":`, err.message);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error('Could not find actual domain using any User-Agent configurations.');
+}
+
+async function fetchCentrifugeConfig() {
+  const baseUrl = await fetchActualDomain();
+  console.log('Fetching Centrifugo config from', baseUrl);
+  
+  const response = await axios.get(baseUrl + '/', {
+    httpsAgent,
+    headers: HEADERS,
+    timeout: 25000
+  });
+  const html = response.data;
+
+  if (!html || html.length < MIN_ALIVE_HTML_SIZE) {
+    throw new Error('Response too small or empty');
+  }
+
+  const wsMatch = html.match(/centrifugoSocket\s*=\s*['"]([^'"]+)['"]/);
+  const tokenMatch = html.match(/centrifugoSecret\s*=\s*['"]([^'"]+)['"]/);
+
+  if (!wsMatch || !tokenMatch) {
+    throw new Error('Centrifugo config not found in HTML');
+  }
+
+  return {
+    siteBaseUrl: baseUrl,
+    wsUrl: wsMatch[1],
+    token: tokenMatch[1]
+  };
+}
+
+function cleanText(text: string) {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function joinUrl(base: string, path: string) {
+  if (!path) return '';
+  if (path.startsWith('http')) return path;
+  const baseUrl = base || 'https://zref.pro';
+  return baseUrl.replace(/\/$/, '') + (path.startsWith('/') ? '' : '/') + path;
+}
+
+function parseChatHtml(html: string) {
+  const $ = cheerio.load(html);
+  const root = $('.rightBlockChatMessageBlock');
+  if (root.length === 0) return null;
+
+  const profileLink = $('a.rightBlockChatAvatarLink, a[href^="/user/"]').first();
+  const rawProfile = profileLink.attr('href') || '';
+  
+  const nickEl = $('.rightBlockChatMessageNick');
+  const nickname = cleanText(nickEl.attr('data-chat-quote-name') || nickEl.text());
+  const message = cleanText($('.rightBlockChatMessageText').text());
+  const messageTime = cleanText($('.rightBlockChatMessageTimeBlock').text());
+  const rawAvatar = $('img').first().attr('src') || '';
+  const badge = cleanText($('.rightBlockHeaderAvatarFlag').text());
+  const classes = (root.attr('class') || '').split(/\s+/).filter(Boolean);
+
+  const messageId = root.attr('data-message-id') || Math.random().toString(36).substring(7);
+
+  return {
+    id: messageId,
+    timeISO: new Date().toISOString(),
+    nickname,
+    message,
+    messageTime,
+    profile: joinUrl(siteBaseUrl, rawProfile),
+    rawProfile,
+    avatar: joinUrl(siteBaseUrl, rawAvatar),
+    badge,
+    classes
+  };
+}
+
+let ws: WebSocket | null = null;
+let io: Server | null = null;
+let pingInterval: NodeJS.Timeout | null = null;
+let watchdogInterval: NodeJS.Timeout | null = null;
+
+async function connectToCentrifugo() {
+  if (ws) {
+    ws.terminate();
+  }
+
+  try {
+    const config = await fetchCentrifugeConfig();
+    siteBaseUrl = config.siteBaseUrl;
+    wsUrl = config.wsUrl;
+    token = config.token;
+    state.isDomainDead = false;
+    io?.emit('active_domain', siteBaseUrl);
+  } catch (err) {
+    console.error('Failed to get config, retrying in 10s...');
+    setTimeout(connectToCentrifugo, 10000);
+    return;
+  }
+
+  console.log('Connecting to Centrifugo:', wsUrl);
+  ws = new WebSocket(wsUrl, {
+    headers: {
+      'Origin': siteBaseUrl,
+      'User-Agent': 'Mozilla/5.0'
+    },
+    rejectUnauthorized: false
+  });
+
+  let messageId = 1;
+  state.lastConnectedTime = Date.now();
+  state.lastPacketTime = Date.now();
+  state.plannedReconnectAt = Date.now() + Math.floor(Math.random() * (PLANNED_RECONNECT_MAX - PLANNED_RECONNECT_MIN) + PLANNED_RECONNECT_MIN);
+
+  ws.on('open', () => {
+    console.log('Connected to Centrifugo WS');
+    state.retryCount = 0;
+    ws?.send(JSON.stringify({
+      id: messageId++,
+      method: METHOD_CONNECT,
+      params: { token }
+    }));
+  });
+
+  ws.on('message', (data) => {
+    state.lastPacketTime = Date.now();
+    const raw = data.toString();
+    const lines = raw.split('\n').filter(l => l.trim());
+    
+    for (const line of lines) {
+      try {
+        const packet = JSON.parse(line);
+
+        if (packet.id === 1 && !packet.error) {
+          ws?.send(JSON.stringify({
+            id: messageId++,
+            method: METHOD_SUBSCRIBE,
+            params: { channel: 'chat' }
+          }));
         }
-    }
-    
-    function createMessageElement(msg) {
-        const div = document.createElement('div');
-        div.className = 'message';
-        
-        const statusBadge = msg.status === 'VIP' ? '<span class="status-vip">👑</span>' : 
-                           (msg.status === 'ADMIN' ? '<span class="status-admin">⚡</span>' : '');
-        
-        div.innerHTML = `
-            <span class="time">[${msg.messageTime || '--:--'}]</span>
-            <span class="nick" onclick="showUserMessages('${msg.userId || ''}', '${escapeHtml(msg.nickname || '')}')">
-                ${escapeHtml(msg.nickname || '?')}${statusBadge}
-            </span>
-            <span class="text">${escapeHtml(msg.message || '')}</span>
-        `;
-        return div;
-    }
-    
-    function addRain(rain) {
-        const rainsDiv = document.getElementById('rainsList');
-        const div = document.createElement('div');
-        div.className = 'message message-rain';
-        div.innerHTML = `
-            <span class="time">[${rain.messageTime || '--:--'}]</span>
-            <span class="rain-icon">🌧️</span>
-            <span class="nick">${escapeHtml(rain.launcher || '?')}</span>
-            <span class="text">💰 ${rain.totalAmount || '?'} | 🏆 ${rain.prizesCount || 0} победителей</span>
-        `;
-        rainsDiv.insertBefore(div, rainsDiv.firstChild);
-        
-        rains.unshift(rain);
-        document.getElementById('rainCount').textContent = rains.length;
-    }
-    
-    async function showUserMessages(userId, nickname) {
-        currentUser = { userId, nickname };
-        
-        try {
-            const response = await fetch(`/user/${userId}/messages`);
-            const userMessages = await response.json();
-            
-            document.getElementById('usersList').style.display = 'none';
-            document.getElementById('userMessagesPanel').style.display = 'block';
-            
-            const container = document.getElementById('userMessages');
-            container.innerHTML = '';
-            container.innerHTML = `<div style="padding: 10px; background: #2a2a3e; margin-bottom: 10px;">💬 Сообщения пользователя: <strong>${escapeHtml(nickname)}</strong></div>`;
-            
-            for (const msg of userMessages.reverse()) {
-                const div = createMessageElement(msg);
-                container.appendChild(div);
+
+        const result = packet.result;
+        if (result && result.type === PUSH_PUBLICATION && result.channel === 'chat') {
+          const publicationData = result.data;
+          if (publicationData && publicationData.data && publicationData.data.html) {
+            const parsed = parseChatHtml(publicationData.data.html);
+            if (parsed) {
+              messages.push(parsed);
+              if (messages.length > MAX_MESSAGES) messages.shift();
+              io?.emit('chat_message', parsed);
             }
-            
-            if (userMessages.length === 0) {
-                container.innerHTML += '<div style="padding: 20px; text-align: center; color: #666;">Нет сообщений от этого пользователя</div>';
-            }
-        } catch (error) {
-            console.error('Failed to load user messages:', error);
+          }
         }
+      } catch (err) {}
     }
+  });
+
+  ws.on('error', (err) => {
+    console.error('Centrifugo WS Error:', err.message);
+  });
+
+  ws.on('close', () => {
+    console.log('Centrifugo WS Closed. Reconnecting...');
+    if (pingInterval) clearInterval(pingInterval);
+    if (watchdogInterval) clearInterval(watchdogInterval);
     
-    function closeUserMessages() {
-        currentUser = null;
-        document.getElementById('usersList').style.display = 'block';
-        document.getElementById('userMessagesPanel').style.display = 'none';
-        loadUsers();
+    const delay = Math.min(30000, 1000 * Math.pow(2, state.retryCount++));
+    setTimeout(connectToCentrifugo, delay);
+  });
+
+  // Ping loop
+  pingInterval = setInterval(() => {
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ id: messageId++, method: METHOD_PING }));
     }
+  }, 25000);
+
+  // Watchdog loop
+  watchdogInterval = setInterval(() => {
+    const now = Date.now();
     
-    async function loadUsers() {
-        try {
-            const response = await fetch('/users');
-            const users = await response.json();
-            
-            const container = document.getElementById('usersList');
-            container.innerHTML = '';
-            
-            for (const user of users) {
-                const div = document.createElement('div');
-                div.className = 'user-item';
-                div.onclick = () => showUserMessages(user.userId, user.nickname);
-                div.innerHTML = `
-                    <div class="user-nick">${escapeHtml(user.nickname)}</div>
-                    <div class="user-status">${user.status || 'обычный'} • ID: ${user.userId}</div>
-                    <div class="user-last">Последнее: ${user.lastSeen || '—'}</div>
-                `;
-                container.appendChild(div);
-            }
-            
-            if (users.length === 0) {
-                container.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Пользователи не найдены</div>';
-            }
-        } catch (error) {
-            console.error('Failed to load users:', error);
-        }
+    // Silent socket check
+    if (now - state.lastPacketTime > SILENT_SOCKET_TIMEOUT) {
+      console.log('Watchdog: Socket silent, forcing reconnect...');
+      ws?.terminate();
+      return;
     }
-    
-    async function searchUser() {
-        const query = document.getElementById('userSearch').value.trim().toLowerCase();
-        if (!query) return;
-        
-        try {
-            const response = await fetch('/users');
-            const users = await response.json();
-            
-            const user = users.find(u => 
-                u.nickname.toLowerCase().includes(query) || 
-                u.userId === query
-            );
-            
-            if (user) {
-                showUserMessages(user.userId, user.nickname);
-                showTab('users');
-                document.getElementById('userSearch').value = '';
-            } else {
-                alert('Пользователь не найден');
-            }
-        } catch (error) {
-            alert('Ошибка поиска');
-        }
+
+    // Planned reconnect
+    if (now > state.plannedReconnectAt) {
+      console.log('Watchdog: Planned reconnect...');
+      ws?.terminate();
+      return;
     }
-    
-    function showTab(tab) {
-        document.getElementById('chatTab').style.display = tab === 'chat' ? 'block' : 'none';
-        document.getElementById('usersTab').style.display = tab === 'users' ? 'block' : 'none';
-        document.getElementById('rainsTab').style.display = tab === 'rains' ? 'block' : 'none';
-        
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        event.target.classList.add('active');
-        
-        if (tab === 'users') {
-            loadUsers();
-        }
+  }, 10000);
+}
+
+// Periodic domain check loop
+setInterval(async () => {
+  if (!siteBaseUrl) return;
+  try {
+    const freshDomain = await fetchActualDomain();
+    if (freshDomain !== siteBaseUrl) {
+      console.log('Mirror changed:', siteBaseUrl, '->', freshDomain);
+      ws?.terminate();
     }
+  } catch (e) {}
+}, DOMAIN_CHECK_INTERVAL);
+
+// Status logging loop
+setInterval(() => {
+  const wsStatus = ws?.readyState === WebSocket.OPEN ? 'OK' : (ws?.readyState === WebSocket.CONNECTING ? 'Connecting' : 'Closed');
+  console.log(`[STATUS] WS: ${wsStatus}, Messages: ${messages.length}, Mirror: ${siteBaseUrl || 'None'}, Retry: ${state.retryCount}`);
+}, 60000);
+
+app.prepare().then(async () => {
+  const server = express();
+  const httpServer = createServer(server);
+  io = new Server(httpServer);
+
+  try {
+    connectToCentrifugo();
+  } catch (err) {
+    console.error('Initial connection failed:', err);
+  }
+
+  // Socket.io connection
+  io.on('connection', (socket) => {
+    console.log('New client connected');
+    socket.emit('init_messages', messages);
+    socket.emit('active_domain', siteBaseUrl);
+    socket.emit('config_update', configState);
     
-    function escapeHtml(text) {
-        if (!text) return '';
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+    socket.on('disconnect', () => {
+      console.log('Client disconnected');
+    });
+  });
+
+  // Server time endpoint (optional, but good for sync)
+  server.get('/api/server-time', (req, res) => {
+    res.json({ time: new Date().toISOString() });
+  });
+
+  // Allowed manual configuration input from frontend
+  server.use(express.json());
+
+  server.get('/api/domen-settings', (req, res) => {
+    res.json(configState);
+  });
+
+  server.post('/api/domen-settings', async (req, res) => {
+    const { targetUserId, useAutoMirror, customMirrorUrl, onlyTargetUser } = req.body;
+    
+    const prevUseAuto = configState.useAutoMirror;
+    const prevCustomUrl = configState.customMirrorUrl;
+
+    if (typeof targetUserId === 'string') configState.targetUserId = targetUserId.trim();
+    if (typeof useAutoMirror === 'boolean') configState.useAutoMirror = useAutoMirror;
+    if (typeof customMirrorUrl === 'string') configState.customMirrorUrl = customMirrorUrl.trim();
+    if (typeof onlyTargetUser === 'boolean') configState.onlyTargetUser = onlyTargetUser;
+
+    console.log('Updated configuration settings:', configState);
+
+    // Notify all active clients in real-time
+    io?.emit('config_update', configState);
+
+    // Reconnect to Centrifugo if mirror settings changed
+    if (prevUseAuto !== configState.useAutoMirror || prevCustomUrl !== configState.customMirrorUrl) {
+      console.log('Mirror configuration changed. Recalculating domain connection...');
+      try {
+        connectToCentrifugo();
+      } catch (err: any) {
+        console.error('Reconnection to custom Centrifugo failed:', err.message);
+      }
     }
-    
-    // Загрузка истории
-    async function loadHistory() {
-        try {
-            const response = await fetch('/chat');
-            const history = await response.json();
-            
-            const messagesDiv = document.getElementById('messages');
-            messagesDiv.innerHTML = '';
-            
-            for (const msg of history.reverse()) {
-                const div = createMessageElement(msg);
-                messagesDiv.appendChild(div);
-            }
-        } catch (error) {
-            console.error('Failed to load history:', error);
-        }
+
+    res.json({ success: true, config: configState });
+  });
+
+  server.post('/api/config', async (req, res) => {
+    const { customMirror, customWsUrl, customToken } = req.body;
+    if (customMirror) {
+      console.log('Received manual mirror override:', customMirror);
+      siteBaseUrl = customMirror;
+      try {
+        const config = await fetchCentrifugeConfig();
+        wsUrl = config.wsUrl;
+        token = config.token;
+        connectToCentrifugo();
+        return res.json({ success: true, siteBaseUrl, wsUrl });
+      } catch (e: any) {
+        return res.status(400).json({ success: false, error: e.message });
+      }
     }
-    
-    loadHistory();
-</script>
-</body>
-</html>
+    if (customWsUrl && customToken) {
+      console.log('Received manual centrifuge config override');
+      wsUrl = customWsUrl;
+      token = customToken;
+      if (customMirror) siteBaseUrl = customMirror;
+      connectToCentrifugo();
+      return res.json({ success: true, wsUrl });
+    }
+    res.status(400).json({ error: 'Invalid config' });
+  });
+
+  server.all(/.*/, (req, res) => {
+    return handle(req, res);
+  });
+
+  httpServer.listen(PORT, () => {
+    console.log(`> Ready on http://localhost:${PORT}`);
+  });
+});
