@@ -1,0 +1,6 @@
+{
+  "name": "Chat Listener",
+  "description": "A real-time chat listener for monitoring specific users from Zref mirrors.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
